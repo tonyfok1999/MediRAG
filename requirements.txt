@@ -1,0 +1,16 @@
+# Pin versions once everything works. Check current releases rather than
+# trusting these constraints blindly.
+
+python-telegram-bot>=21.0   # v20 was a breaking async rewrite; v21+ needs py3.10+
+python-dotenv
+
+# retrieval
+qdrant-client
+transformers
+torch
+datasets
+rank-bm25                   # Day 10 only
+
+# utilities
+tqdm
+numpy

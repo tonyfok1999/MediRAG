@@ -141,3 +141,29 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# ---------------------------------------------------------------
+# Python / MediRAG
+# (everything above is the stock Node template — .env and
+#  !.env.example on lines 69-71 already do the right thing)
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# corpus, embeddings, index — large, regenerable, never commit
+data/raw/
+*.npy
+*.npz
+qdrant_storage/
+
+# LLM response cache (regenerable, grows large)
+eval/.llm_cache/
+
+# NOTE: eval/results/ is deliberately NOT ignored. Those files are the
+# evidence behind the README results table. Commit them.
