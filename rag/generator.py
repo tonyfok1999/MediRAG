@@ -7,23 +7,55 @@ questions and trust the difference between two runs.
 from __future__ import annotations
 
 from config import Config
-from schema import Message, RetrievalResult
+from schema import Message, RetrievalResult, Role, render_transcript
 
 
-SYSTEM_PROMPT = """TODO(day 3).
+SYSTEM_PROMPT = """
+You are an AI doctor for a virtual medical intake service, helping users with questions about their symptoms, general health concerns, and preliminary triage. Your communication style is warm, empathetic, and professional.
 
-Must cover:
-  - role: health information, explicitly NOT diagnosis
-  - ground answers in the provided context; say so when context is insufficient
-  - cite which snippets were used
-  - the scope boundary from scope.md
-  - urgency guidance: self-care / see a GP / urgent care / emergency
-  - plain language, no jargon without explanation
+Always: 1) Acknowledge user concerns and discomfort with care, 2) Provide clear, grounded explanations using simple layperson language, 3) Conduct multi-turn diagnostic intake by asking targeted follow-up questions to gather clinical details. When users express worry or pain, respond with understanding and focus on supportive guidance.
 
-Keep this in version control and treat prompt edits like code changes — when
-your eval number moves, you need to know whether the prompt or the retriever
-caused it. Rerun the eval after every prompt change.
-"""
+You can help with: gathering symptom timelines, explaining medical concepts found strictly in your reference materials, and asking intake questions to clarify the user's situation.
+
+You cannot: provide definitive medical diagnoses, prescribe medications, or draw on general medical knowledge outside of your provided reference documents.
+
+For queries where information is missing from your reference materials, ask the user for more details to help gather better information.
+
+For critical emergency symptoms—such as severe chest pain, sudden numbness, or difficulty breathing—immediately instruct the user to call 911 or go to the nearest emergency room.
+
+Avoid complex technical jargon unless you explain it immediately.
+
+End every interaction with the following disclaimer: "Disclaimer: I am an AI assistant simulating a clinical intake, not a licensed human physician. The information provided is for educational purposes based on retrieved reference documents and should not replace professional medical evaluation, diagnosis, or emergency care."
+""".strip()
+
+
+# Placeholder for turn 1. An empty history slot is ambiguous to the model in the
+# same way an empty context block is — say the thing explicitly.
+NO_PRIOR_TURNS = "(no prior turns)"
+
+# Kept as its own constant, and injected through a template slot, so it can be
+# ablated: swap it for "" and re-run Tier 1. Cheapest experiment in the project.
+ANSWER_INSTRUCTION = (
+    "Answer the patient's current message using only the reference material above. "
+    "Cite every substantive claim with its bracketed id, e.g. [1]. "
+    "If the reference material does not cover the question, say so explicitly "
+    "rather than answering from general knowledge."
+)
+
+PROMPT_TEMPLATE = """\
+Reference material:
+
+{context}
+
+Conversation so far:
+
+{history}
+
+Patient's current message:
+
+{question}
+
+{instruction}"""
 
 
 def build_prompt(
@@ -31,14 +63,35 @@ def build_prompt(
     retrieval: RetrievalResult,
     cfg: Config,
 ) -> str:
-    """Assemble system prompt + context + conversation into the final prompt.
 
-    Decisions to make and write down:
-      - context before or after the conversation? (order affects attention)
-      - how many chunks? cfg.max_context_chunks
-      - how to label chunks so citations are traceable back to chunk ids
-    """
-    raise NotImplementedError
+    if not conversation:
+        raise ValueError("build_prompt requires at least one message")
+
+    # Last message must be from the user
+    if Role(conversation[-1].role) is not Role.USER:
+        raise ValueError(
+            "build_prompt expects the last message to be from the user; got "
+            f"{conversation[-1].role!r}. Raising rather than warning on purpose: "
+            "a silently malformed prompt shows up as an unexplained accuracy "
+            "drop days later."
+        )
+
+    #get last message and earlier messages
+    *earlier, current = conversation
+
+    # retrieve search results as a context block
+    context = retrieval.as_context(max_chunks=cfg.max_context_chunks)
+
+    #label the role to earlier messages
+    history = render_transcript(earlier)
+
+    prompt = PROMPT_TEMPLATE.format(
+        context=context,
+        history=history or NO_PRIOR_TURNS,
+        question=current.text,
+        instruction=ANSWER_INSTRUCTION,
+    )
+    return prompt.strip()
 
 
 def answer(

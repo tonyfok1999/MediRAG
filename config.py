@@ -1,5 +1,11 @@
-from dataclasses import dataclass, asdict
 import hashlib, json
+from dataclasses import dataclass, asdict
+
+from dotenv import load_dotenv
+
+# Every entry point imports Config, so .env loads exactly once, here —
+# rather than in whichever script happened to remember to call it.
+load_dotenv()
 
 @dataclass(frozen=True)
 class Config:
@@ -7,6 +13,10 @@ class Config:
     corpus: str = "MedRAG/textbooks"
     query_encoder: str = "ncbi/MedCPT-Query-Encoder"
     article_encoder: str = "ncbi/MedCPT-Article-Encoder"
+    # MedCPT's query encoder truncates here and drops the rest silently.
+    # Shared by the retriever (guards + truncates) and the rewriter
+    # (enforces its output stays under it) — hence config, not either module.
+    max_query_tokens: int = 64
     cache_dir: str = ".cache/corpus"
     cache_embed: str = ".cache/embeddings"
 

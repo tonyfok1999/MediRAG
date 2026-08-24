@@ -17,7 +17,6 @@ from config import Config
 from schema import Chunk
 
 QDRANT_URL = "http://localhost:6333"
-MAX_QUERY_TOKENS = 64  # MedCPT's query encoder truncates here and drops the rest silently
 
 
 class Retriever:
@@ -40,10 +39,10 @@ class Retriever:
 
         # 1. Guard query length: warn if it'll get silently truncated.
         n_tokens = len(self.tokenizer.tokenize(query))
-        if n_tokens > MAX_QUERY_TOKENS:
+        if n_tokens > self.cfg.max_query_tokens:
             warnings.warn(
                 f"query is {n_tokens} tokens; MedCPT's query encoder truncates "
-                f"at {MAX_QUERY_TOKENS} — the tail of this query will be dropped."
+                f"at {self.cfg.max_query_tokens} — the tail of this query will be dropped."
             )
 
         # 2. Encode the query with the QUERY encoder ([CLS] pooling, same
@@ -55,7 +54,7 @@ class Retriever:
                 truncation=True,
                 padding=True,
                 return_tensors="pt",
-                max_length=MAX_QUERY_TOKENS,
+                max_length=self.cfg.max_query_tokens,
             )
             query_vector = self.model(**encoded).last_hidden_state[:, 0, :][0].tolist()
 
