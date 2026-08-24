@@ -25,6 +25,32 @@ class Message:
     text: str
 
 
+# How each turn is labelled when a conversation is rendered into a prompt.
+# Deliberately NOT the raw Role values: "bot:" is a label no model has seen in
+# training, and keeping these distinct from the API's own user/assistant roles
+# stops the rendered transcript from being confused with real message roles.
+#
+# Lives here rather than in rag/generator.py because both the generator and the
+# rewriter render transcripts, and rewriter.py importing generator.py would run
+# the dependency backwards.
+ROLE_LABELS = {Role.USER: "Patient", Role.BOT: "Assistant"}
+
+
+def render_transcript(messages: list["Message"]) -> str:
+    """Render a conversation as labelled plain text for a prompt.
+
+    Returns "" for an empty list — the caller substitutes its own placeholder,
+    because "(no prior turns)" and "(no conversation yet)" are prompt-specific
+    wording, not a shared concern.
+
+    Role(...) coerces both a Role member and a bare "user"/"bot" string, so a
+    Message built without the enum doesn't KeyError one frame deeper. Role is a
+    str-Enum, so Role.USER == "user" is True, but their hashes differ — the
+    plain string would miss the dict lookup.
+    """
+    return "\n".join(f"{ROLE_LABELS[Role(m.role)]}: {m.text}" for m in messages)
+
+
 @dataclass
 class Chunk:
     """One retrieved corpus snippet.
@@ -55,9 +81,14 @@ class RetrievalResult:
     latency_ms: float = 0.0
 
     def as_context(self, max_chunks: int | None = None) -> str:
-        """Flatten chunks into the context string for the prompt.
 
-        TODO(day 3): decide the format. Numbered? Titled? Separators matter
-        more than you'd expect for citation accuracy — try at least two.
-        """
-        raise NotImplementedError
+        # Truncate the result to a maximum number of chunks if specified.
+        chunks = self.chunks[:max_chunks] if max_chunks else self.chunks
+        if not chunks:
+            return "No reference material was retrieved for this query."
+
+        # Format each chunk as an <reference> XML element.
+        return "\n\n".join(
+            f'<reference id="{i}" source="{c.title}">\n{c.text}\n</reference>'
+            for i, c in enumerate(chunks, start=1)
+        )

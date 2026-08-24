@@ -1,5 +1,5 @@
-from dataclasses import dataclass, asdict
 import hashlib, json
+from dataclasses import dataclass, asdict
 
 @dataclass(frozen=True)
 class Config:
@@ -7,6 +7,10 @@ class Config:
     corpus: str = "MedRAG/textbooks"
     query_encoder: str = "ncbi/MedCPT-Query-Encoder"
     article_encoder: str = "ncbi/MedCPT-Article-Encoder"
+    # MedCPT's query encoder truncates here and drops the rest silently.
+    # Shared by the retriever (guards + truncates) and the rewriter
+    # (enforces its output stays under it) — hence config, not either module.
+    max_query_tokens: int = 64
     cache_dir: str = ".cache/corpus"
     cache_embed: str = ".cache/embeddings"
 

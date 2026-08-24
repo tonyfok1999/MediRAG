@@ -13,8 +13,34 @@ retrieval runs on a truncated fragment of the complaint.
 
 from __future__ import annotations
 
+import functools
+
+from transformers import AutoTokenizer
+
 from config import Config
-from schema import Message
+from schema import Message, render_transcript
+
+
+@functools.lru_cache(maxsize=1)
+def _tokenizer(name: str):
+    """MedCPT's query tokenizer, loaded once per process.
+
+    A tokenizer is just a vocab file — a few MB, no model weights — so this is
+    not a second copy of MedCPT sitting in memory alongside the retriever's.
+    Cached because rewrite_query runs once per turn, and re-reading the vocab
+    every call is the same mistake Retriever.__init__ warns about, just smaller.
+    """
+    return AutoTokenizer.from_pretrained(name)
+
+
+def count_query_tokens(query: str, cfg: Config) -> int:
+    """Length of `query` in MedCPT query-encoder tokens.
+
+    Count tokens, never words. "pleuritic" is one word and several tokens, so
+    a word count will read 40 while the encoder is already past its 64-token
+    limit — and everything past that limit is dropped without an error.
+    """
+    return len(_tokenizer(cfg.query_encoder).tokenize(query))
 
 
 def rewrite_query(conversation: list[Message], cfg: Config) -> str:
