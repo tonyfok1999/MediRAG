@@ -1,12 +1,6 @@
 import hashlib, json
 from dataclasses import dataclass, asdict
 
-from dotenv import load_dotenv
-
-# Every entry point imports Config, so .env loads exactly once, here —
-# rather than in whichever script happened to remember to call it.
-load_dotenv()
-
 @dataclass(frozen=True)
 class Config:
     # retrieval
