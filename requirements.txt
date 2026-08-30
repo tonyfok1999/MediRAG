@@ -4,6 +4,11 @@
 python-telegram-bot>=21.0   # v20 was a breaking async rewrite; v21+ needs py3.10+
 python-dotenv
 
+# generation — rag/llm.py imports whichever matches cfg.llm_provider
+openai
+anthropic
+google-genai
+
 # retrieval
 qdrant-client
 transformers

@@ -21,7 +21,10 @@ class Config:
     rrf_k: int = 60
 
     # generation
-    llm_model: str = "..."          # your API model
+    # Which SDK rag/llm.py reaches for. The two fields move together —
+    # switching provider without switching model id is an immediate 404.
+    llm_provider: str = "gemini"    # "openai" | "gemini" | "anthropic"
+    llm_model: str = "gemini-3.7-flash"
     temperature: float = 0.0
     max_context_chunks: int = 5
 

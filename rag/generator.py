@@ -6,7 +6,11 @@ questions and trust the difference between two runs.
 
 from __future__ import annotations
 
+import re
+import warnings
+
 from config import Config
+from rag import llm
 from schema import Message, RetrievalResult, Role, render_transcript
 
 
@@ -94,13 +98,80 @@ def build_prompt(
     return prompt.strip()
 
 
+# Matches the [1] markers ANSWER_INSTRUCTION asks the model to emit. Small
+# integers on purpose: chunk ids are long and opaque, and models corrupt or
+# invent them. An integer either indexes a chunk we actually sent or it does
+# not, which makes a bad citation detectable instead of plausible.
+CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+
+
+def _cited_ids(text: str, n_chunks: int) -> tuple[list[int], list[int]]:
+    """Split the [i] markers in `text` into resolvable and unresolvable ids.
+
+    Order preserved, duplicates dropped — a claim cited three times is one
+    source, but the footer should list sources in the order the reader met them.
+    """
+    seen: set[int] = set()
+    valid: list[int] = []
+    invalid: list[int] = []
+    for match in CITATION_PATTERN.finditer(text):
+        i = int(match.group(1))
+        if i in seen:
+            continue
+        seen.add(i)
+        (valid if 1 <= i <= n_chunks else invalid).append(i)
+    return valid, invalid
+
+
+def _append_sources(response: str, retrieval: RetrievalResult, cfg: Config) -> str:
+    """Resolve [i] back to a titled source and append a footer.
+
+    The slice MUST match the one as_context() used, or [3] in the answer names a
+    different chunk than [3] in the prompt — a citation that looks right, points
+    somewhere else, and never raises. cfg.max_context_chunks is the shared value
+    that keeps them aligned; there is no need to pass the mapping around because
+    slicing is deterministic.
+    """
+    chunks = retrieval.chunks[: cfg.max_context_chunks]
+    valid, invalid = _cited_ids(response, len(chunks))
+
+    if invalid:
+        # Not a crash: a fabricated citation is a grounding failure, not a
+        # transport failure, and the answer body may still be fine. Counting the
+        # rate across an eval run is a cheap metric almost nobody reports.
+        warnings.warn(
+            f"answer cited {invalid} but only {len(chunks)} chunks were in the "
+            f"prompt — those markers resolve to nothing and were dropped."
+        )
+
+    if not valid:
+        return response
+
+    footer = "\n".join(
+        f"[{i}] {chunks[i - 1].title} ({chunks[i - 1].id})" for i in valid
+    )
+    return f"{response}\n\nSources:\n{footer}"
+
+
 def answer(
     conversation: list[Message],
     retrieval: RetrievalResult,
     cfg: Config,
 ) -> str:
-    """Generate the user-facing answer."""
-    raise NotImplementedError
+    """Generate the user-facing answer.
+
+    Three stages, deliberately separable: assemble (pure), call (network),
+    resolve citations (pure). Only the middle one can fail in an interesting
+    way, and the two pure halves are unit-testable without a key.
+
+    SYSTEM_PROMPT goes in the system slot rather than the returned string —
+    stable across every call, so it is the natural prompt-cache prefix, and
+    instructions there carry more weight than the same text pasted into a user
+    turn.
+    """
+    prompt = build_prompt(conversation, retrieval, cfg)
+    response = llm.complete(prompt, system=SYSTEM_PROMPT, cfg=cfg)
+    return _append_sources(response, retrieval, cfg)
 
 
 def answer_mcq(question: str, options: dict[str, str], cfg: Config) -> tuple[str, str]:
