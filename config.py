@@ -24,7 +24,10 @@ class Config:
     # Which SDK rag/llm.py reaches for. The two fields move together —
     # switching provider without switching model id is an immediate 404.
     llm_provider: str = "gemini"    # "openai" | "gemini" | "anthropic"
-    llm_model: str = "gemini-3.7-flash"
+    # Pinned, not "gemini-flash-latest": a floating alias silently changes the
+    # model under a results table. 3.7-flash returns 503 under load — the
+    # newest model is not the safest one to run 300 sequential eval calls on.
+    llm_model: str = "gemini-3.5-flash"
     temperature: float = 0.0
     max_context_chunks: int = 5
 

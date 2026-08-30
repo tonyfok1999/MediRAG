@@ -6,12 +6,15 @@ questions and trust the difference between two runs.
 
 from __future__ import annotations
 
+import logging
 import re
 import warnings
 
 from config import Config
 from rag import llm
 from schema import Message, RetrievalResult, Role, render_transcript
+
+log = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """
@@ -102,7 +105,38 @@ def build_prompt(
 # integers on purpose: chunk ids are long and opaque, and models corrupt or
 # invent them. An integer either indexes a chunk we actually sent or it does
 # not, which makes a bad citation detectable instead of plausible.
-CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+# The corpus stores a book slug and nothing finer — no chapter, no section, no
+# page (payload fields are text/title/chunk_id/source). A book name is therefore
+# the most precise citation this corpus can honestly support, which is what
+# makes the deduped one-line footer the right shape rather than a compromise.
+# Slugs are mapped because "Obstentrics_Williams" — the corpus's own typo — is
+# not something to show a patient.
+BOOK_TITLES = {
+    "Anatomy_Gray": "Gray's Anatomy for Students",
+    "Biochemistry_Lippinco": "Lippincott Illustrated Reviews: Biochemistry",
+    "Cell_Biology_Alberts": "Molecular Biology of the Cell",
+    "First_Aid_Step1": "First Aid for the USMLE Step 1",
+    "First_Aid_Step2": "First Aid for the USMLE Step 2 CK",
+    "Gynecology_Novak": "Berek & Novak's Gynecology",
+    "Histology_Ross": "Ross Histology: A Text and Atlas",
+    "Immunology_Janeway": "Janeway's Immunobiology",
+    "InternalMed_Harrison": "Harrison's Principles of Internal Medicine",
+    "Neurology_Adams": "Adams and Victor's Principles of Neurology",
+    "Obstentrics_Williams": "Williams Obstetrics",
+    "Pathology_Robbins": "Robbins & Cotran Pathologic Basis of Disease",
+    "Pathoma_Husain": "Pathoma: Fundamentals of Pathology",
+    "Pediatrics_Nelson": "Nelson Textbook of Pediatrics",
+    "Pharmacology_Katzung": "Katzung Basic and Clinical Pharmacology",
+    "Physiology_Levy": "Berne & Levy Physiology",
+    "Psichiatry_DSM-5": "Diagnostic and Statistical Manual of Mental Disorders (DSM-5)",
+    "Surgery_Schwartz": "Schwartz's Principles of Surgery",
+}
+
+# Matches [1] and the grouped form [1, 2, 5] that models write unprompted.
+# Missing the grouped form is not a cosmetic bug: an unmatched group is neither
+# valid nor invalid, so the source silently never reaches the footer AND no
+# warning fires. Keep this able to over-match rather than under-match.
+CITATION_PATTERN = re.compile(r"\[\s*(\d+(?:\s*,\s*\d+)*)\s*]")
 
 
 def _cited_ids(text: str, n_chunks: int) -> tuple[list[int], list[int]]:
@@ -115,22 +149,36 @@ def _cited_ids(text: str, n_chunks: int) -> tuple[list[int], list[int]]:
     valid: list[int] = []
     invalid: list[int] = []
     for match in CITATION_PATTERN.finditer(text):
-        i = int(match.group(1))
-        if i in seen:
-            continue
-        seen.add(i)
-        (valid if 1 <= i <= n_chunks else invalid).append(i)
+        for part in match.group(1).split(","):
+            i = int(part.strip())
+            if i in seen:
+                continue
+            seen.add(i)
+            (valid if 1 <= i <= n_chunks else invalid).append(i)
     return valid, invalid
 
 
 def _append_sources(response: str, retrieval: RetrievalResult, cfg: Config) -> str:
-    """Resolve [i] back to a titled source and append a footer.
+    """Renumber citations by BOOK and append a numbered source list.
+
+    The model cites chunk indices, because that is what as_context() labels and
+    what makes a fabricated citation mechanically detectable. But a chunk index
+    is an internal detail: five markers in the prose imply five sources, and
+    dense retrieval routinely draws four of five chunks from one textbook. The
+    reader is left counting sources that do not exist.
+
+    So the markers are remapped on the way out — every chunk from Harrison's
+    becomes [1], the Williams chunk becomes [2] — and each number now resolves
+    to a line the reader can actually see. Grouped citations collapse for free:
+    [1, 2] over two chunks of the same book renders as [1].
+
+    Chunk-level precision is not lost, it moves to the log, where the audience
+    is you tracing a bad answer rather than a patient reading one.
 
     The slice MUST match the one as_context() used, or [3] in the answer names a
     different chunk than [3] in the prompt — a citation that looks right, points
-    somewhere else, and never raises. cfg.max_context_chunks is the shared value
-    that keeps them aligned; there is no need to pass the mapping around because
-    slicing is deterministic.
+    somewhere else, and never raises. cfg.max_context_chunks keeps them aligned;
+    slicing is deterministic, so no mapping has to be passed around.
     """
     chunks = retrieval.chunks[: cfg.max_context_chunks]
     valid, invalid = _cited_ids(response, len(chunks))
@@ -147,10 +195,37 @@ def _append_sources(response: str, retrieval: RetrievalResult, cfg: Config) -> s
     if not valid:
         return response
 
-    footer = "\n".join(
-        f"[{i}] {chunks[i - 1].title} ({chunks[i - 1].id})" for i in valid
+    # Book numbering follows first appearance in the answer, so the reader meets
+    # [1] before [2].
+    display = {i: BOOK_TITLES.get(chunks[i - 1].title, chunks[i - 1].title) for i in valid}
+    books: list[str] = []
+    for i in valid:
+        if display[i] not in books:
+            books.append(display[i])
+    book_no = {i: books.index(display[i]) + 1 for i in valid}
+
+    log.info(
+        "citations: %s",
+        " ".join(f"[{book_no[i]}]<-chunk{i}={chunks[i - 1].id}" for i in valid),
     )
-    return f"{response}\n\nSources:\n{footer}"
+
+    def _remap(match: re.Match) -> str:
+        seen: list[int] = []
+        for part in match.group(1).split(","):
+            n = book_no.get(int(part.strip()))
+            if n is not None and n not in seen:
+                seen.append(n)
+        return "".join(f"[{n}]" for n in seen)
+
+    text = CITATION_PATTERN.sub(_remap, response)
+    # An unresolvable marker renders as "", which strands the space in front of
+    # it: "claim [9]." would become "claim ." Tidy both that and any doubled
+    # space the substitution leaves behind.
+    text = re.sub(r" +([.,;:])", lambda m: m.group(1), text)
+    text = re.sub(r"  +", " ", text)
+
+    footer = "\n".join(f"[{n}] {name}" for n, name in enumerate(books, start=1))
+    return f"{text}\n\nSources:\n{footer}"
 
 
 def answer(
