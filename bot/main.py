@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -40,6 +41,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 TELEGRAM_MAX = 4096
+# Split against a lower ceiling than Telegram's: the HTML tags are added
+# after splitting, so a part sized to exactly 4096 would overflow once
+# <b> and &amp; expansions land on it.
+SPLIT_LIMIT = 3500
 
 DISCLAIMER = (
     "⚕️ I provide general health information, not medical advice. "
@@ -106,21 +111,59 @@ async def keep_typing(bot, chat_id: int, interval: float = 4.0):
             await task
 
 
-async def send(update: Update, text: str) -> None:
-    """Send a reply, split if needed.
+# Telegram's HTML subset: <b> <i> <u> <s> <code> <pre> <a> <blockquote>. No
+# headers, no lists — so a header becomes bold and a bullet becomes "• ".
+_CODE = re.compile(r"`([^`\n]+)`")
+_HEADER = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]*(.+?)[ \t]*#*[ \t]*$")
+_BULLET = re.compile(r"(?m)^([ \t]*)[-*+][ \t]+")
+_BOLD = re.compile(r"\*\*([^*\n]+?)\*\*")
+_ITALIC = re.compile(r"(?<!\*)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)")
 
-    No parse mode at all. Both of Telegram's are traps for raw LLM output:
-    MarkdownV2 requires escaping a long list of special characters, and HTML
-    rejects the whole message with a 400 on any stray < or > — likely here,
-    since the prompt is built out of <reference> blocks the model can echo.
-    split_message can also slice a tag in half, producing a second failure on
-    a message that would otherwise have been fine.
 
-    The cost is that the model's **bold** and ### headers arrive as literal
-    characters. That is a cosmetic problem; a rejected message is not.
+def md_to_telegram_html(text: str) -> str:
+    """Render the model's Markdown as Telegram HTML.
+
+    Escape FIRST, then insert tags. Everything added after the escape is our
+    own markup, so a <reference> block echoed out of the prompt arrives as
+    inert &lt;reference&gt; text rather than taking the whole message down with
+    a 400. Clinical prose like "under <30 minutes" is safe for the same reason.
     """
-    for part in split_message(text):
-        await update.message.reply_text(part)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Park code spans so the emphasis passes cannot reach inside them. Building
+    # <code> first and then running the italic rule over the whole string
+    # produces <code>x_<i>y</i></code> — nested tags Telegram rejects.
+    spans: list[str] = []
+
+    def _park(match: re.Match) -> str:
+        spans.append(match.group(1))
+        return f"\x00{len(spans) - 1}\x00"
+
+    text = _CODE.sub(_park, text)
+
+    # [ \t], never \s: \s matches newlines, so \s{0,3} silently swallows the
+    # blank line above a header and collapses the paragraph break.
+    text = _HEADER.sub(r"<b>\1</b>", text)
+    text = _BULLET.sub(r"\1• ", text)   # before italics, or a leading "* " opens a span
+    text = _BOLD.sub(r"<b>\1</b>", text)
+    text = _ITALIC.sub(r"<i>\1</i>", text)
+
+    for i, code in enumerate(spans):
+        text = text.replace(f"\x00{i}\x00", f"<code>{code}</code>")
+
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+async def send(update: Update, text: str) -> None:
+    """Send a reply, split if needed, formatted as Telegram HTML.
+
+    Split BEFORE formatting, so every part is independently well-formed and a
+    <b> span can never straddle a message boundary — that would 400 both
+    halves. Splitting on the raw text also means the limit is applied to
+    something shorter than what is finally sent, hence the headroom below.
+    """
+    for part in split_message(text, limit=SPLIT_LIMIT):
+        await update.message.reply_text(md_to_telegram_html(part), parse_mode="HTML")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
