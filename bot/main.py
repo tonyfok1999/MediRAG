@@ -9,12 +9,16 @@ version on anything you copy from Stack Overflow.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
+from config import Config
+from rag.pipeline import MediRAG
+from schema import Message, Role
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -120,28 +124,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         # ── pipeline ────────────────────────────────────────────────────
-        # session = store.get(chat_id)
-        # session.add(Message(Role.USER, text))
+        # Still to wire in (Phases 2-4): SessionStore for multi-turn history,
+        # safety.screen() before retrieval, and the agent ASK/ANSWER decision.
         #
-        # verdict, reply = safety.screen(text, session.history, cfg)
-        # if verdict is not SafetyVerdict.OK:
-        #     await send(update, reply)
-        #     return
-        #
-        # session.slots |= agent.extract_slots(session, cfg)
-        # decision = agent.decide(session, cfg)
-        #
-        # if decision.action is Action.ASK:
-        #     reply = decision.question
-        #     session.questions_asked += 1
-        # else:
-        #     query = rewriter.rewrite_query(session.history, cfg)
-        #     retrieval = retriever.search(query)
-        #     reply = generator.answer(session.history, retrieval, cfg)
-        #
-        # session.add(Message(Role.BOT, reply))
-        # store.save(session)
-        reply = f"(not wired up yet) you said: {text}"
+        # to_thread is not optional here. MediRAG.answer() is fully synchronous
+        # and slow — a torch forward pass, a Qdrant round-trip, and TWO LLM
+        # calls (rewrite, then generate). Measured end-to-end: 19s, 36s, 46s.
+        # Calling it directly from this coroutine would park the single asyncio
+        # event loop for that whole time: no polling, no replies to any other
+        # chat, not even the typing indicator above. One user would block
+        # everyone. to_thread hands it to a worker so the loop stays free.
+        system: MediRAG = context.application.bot_data["rag"]
+        conversation = [Message(role=Role.USER, text=text)]
+        reply = await asyncio.to_thread(system.answer, conversation)
         # ────────────────────────────────────────────────────────────────
         await send(update, reply)
 
@@ -157,6 +152,12 @@ def main() -> None:
         raise SystemExit("TELEGRAM_TOKEN not set — copy .env.example to .env")
 
     app = Application.builder().token(token).build()
+
+    # Built once, here — never per message. MediRAG holds the Retriever,
+    # whose first use loads MedCPT; constructing it per update would pay
+    # that cost on every message and hold N copies of a transformer.
+    app.bot_data["rag"] = MediRAG(Config())
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("scope", scope_cmd))
