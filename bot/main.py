@@ -10,8 +10,10 @@ version on anything you copy from Stack Overflow.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -71,14 +73,54 @@ def split_message(text: str, limit: int = TELEGRAM_MAX) -> list[str]:
     return parts
 
 
+@asynccontextmanager
+async def keep_typing(bot, chat_id: int, interval: float = 4.0):
+    """Hold the "typing…" indicator for as long as the block runs.
+
+    send_chat_action sets the indicator for about five seconds, then Telegram
+    drops it. Answers here take 19-46 seconds, so firing it once means the user
+    watches typing stop two-thirds of the way through and concludes the bot
+    died. Re-sending on a 4s cadence keeps it lit until the reply lands.
+
+    Runs as a background task rather than inline because the work it is
+    covering is awaited on the same loop; cancelled in `finally` so an
+    exception in the pipeline cannot leave the task running forever.
+    """
+
+    async def loop() -> None:
+        while True:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                # A dropped chat action is cosmetic. Never let it take down the
+                # request it is decorating.
+                log.debug("chat action failed for chat_id=%s", chat_id, exc_info=True)
+            await asyncio.sleep(interval)
+
+    task = asyncio.create_task(loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 async def send(update: Update, text: str) -> None:
     """Send a reply, split if needed.
 
-    HTML parse mode, not MarkdownV2: MarkdownV2 requires escaping a long list
-    of special characters and will raise on raw LLM output.
+    No parse mode at all. Both of Telegram's are traps for raw LLM output:
+    MarkdownV2 requires escaping a long list of special characters, and HTML
+    rejects the whole message with a 400 on any stray < or > — likely here,
+    since the prompt is built out of <reference> blocks the model can echo.
+    split_message can also slice a tag in half, producing a second failure on
+    a message that would otherwise have been fine.
+
+    The cost is that the model's **bold** and ### headers arrive as literal
+    characters. That is a cosmetic problem; a rejected message is not.
     """
     for part in split_message(text):
-        await update.message.reply_text(part, parse_mode="HTML")
+        await update.message.reply_text(part)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -119,9 +161,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await send(update, "Send me a description of what you're experiencing.")
         return
 
-    # RAG takes 3-10 seconds. Without this, users assume the bot is broken.
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
     try:
         # ── pipeline ────────────────────────────────────────────────────
         # Still to wire in (Phases 2-4): SessionStore for multi-turn history,
@@ -136,7 +175,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # everyone. to_thread hands it to a worker so the loop stays free.
         system: MediRAG = context.application.bot_data["rag"]
         conversation = [Message(role=Role.USER, text=text)]
-        reply = await asyncio.to_thread(system.answer, conversation)
+        async with keep_typing(context.bot, chat_id):
+            reply = await asyncio.to_thread(system.answer, conversation)
         # ────────────────────────────────────────────────────────────────
         await send(update, reply)
 
