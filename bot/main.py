@@ -17,13 +17,19 @@ import re
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.constants import ChatAction
 from agent.session import SessionStore
 from config import Config
 from rag.pipeline import MediRAG
 from schema import Message, Role
 from telegram.ext import (
+    CallbackQueryHandler,
     Application,
     CommandHandler,
     ContextTypes,
@@ -46,6 +52,20 @@ TELEGRAM_MAX = 4096
 # after splitting, so a part sized to exactly 4096 would overflow once
 # <b> and &amp; expansions land on it.
 SPLIT_LIMIT = 3500
+
+# An INLINE keyboard, not a reply keyboard. A reply keyboard is an input
+# surface: it occupies the same space as the system keyboard, so it is only
+# visible while the user is not typing — is_persistent only promises to show it
+# "when the regular keyboard is hidden". An inline keyboard lives inside a
+# message bubble in the chat scroll instead, so attached to the newest message
+# it sits directly above the text field and stays put while typing.
+#
+# callback_data is stateless: a tap on an old message's button still starts a
+# new session correctly, so nothing has to be cleaned up as the chat grows.
+NEW_SESSION_INLINE = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🔄 New session", callback_data="new_session")]]
+)
+
 
 DISCLAIMER = (
     "⚕️ I provide general health information, not medical advice. "
@@ -155,40 +175,44 @@ def md_to_telegram_html(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-async def send(update: Update, text: str) -> None:
+async def send(update: Update, text: str, reply_markup=None) -> None:
     """Send a reply, split if needed, formatted as Telegram HTML.
 
     Split BEFORE formatting, so every part is independently well-formed and a
     <b> span can never straddle a message boundary — that would 400 both
     halves. Splitting on the raw text also means the limit is applied to
-    something shorter than what is finally sent, hence the headroom below.
+    something shorter than what is finally sent, hence the headroom in
+    SPLIT_LIMIT.
+
+    reply_markup rides on the LAST part only, so the button lands at the very
+    bottom of a multi-part answer rather than repeating between the parts.
+
+    effective_message, not update.message: a callback query (an inline button
+    tap) carries no update.message, and reading it there would raise.
     """
-    for part in split_message(text, limit=SPLIT_LIMIT):
-        await update.message.reply_text(md_to_telegram_html(part), parse_mode="HTML")
+    parts = split_message(text, limit=SPLIT_LIMIT)
+    for i, part in enumerate(parts):
+        await update.effective_message.reply_text(
+            md_to_telegram_html(part),
+            parse_mode="HTML",
+            reply_markup=reply_markup if i == len(parts) - 1 else None,
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Greeting, and the one place the old docked keyboard gets cleared.
+
+    ReplyKeyboardRemove and an inline keyboard are both reply_markup, so they
+    cannot share a message. This is the natural home for the removal: it is a
+    one-time UI reset for anyone left holding the previous build's reply
+    keyboard, and there is no session to restart yet, so no button is needed.
+    """
     await send(
         update,
         f"Hi — describe what you're experiencing and I'll help you "
         f"understand it.\n\n{DISCLAIMER}",
+        reply_markup=ReplyKeyboardRemove(),
     )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send(
-        update,
-        "<b>Commands</b>\n"
-        "/start — begin\n"
-        "/new — start a new session (clears everything)\n"
-        "/scope — what I can and can't help with\n"
-        "/help — this message",
-    )
-
-
-async def scope_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # TODO(day 7): render from scope.md so there's one source of truth.
-    await send(update, "TODO: scope card")
 
 
 def chat_lock(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> asyncio.Lock:
@@ -214,11 +238,24 @@ async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     Deliberately total. A session is one complaint, and carrying anything
     across the boundary means the next answer is shaped by the last illness.
+
+    Serves both the /new command and the inline button. A callback query must be
+    answered within a few seconds or the client leaves the button spinning, so
+    that happens before the lock — clearing a dict is fast, but the lock may be
+    held by an in-flight answer for the better part of a minute.
     """
+    if update.callback_query is not None:
+        await update.callback_query.answer("Starting a new session")
+
     chat_id = update.effective_chat.id
     async with chat_lock(context, chat_id):
         context.application.bot_data["sessions"].clear(chat_id)
-    await send(update, "Started a new session. Tell me what's going on.")
+
+    await send(
+        update,
+        f"Started a new session. Tell me what's going on.\n\n{DISCLAIMER}",
+        reply_markup=NEW_SESSION_INLINE,
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -258,7 +295,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session.add(Message(role=Role.BOT, text=reply))
             store.save(session)
         # ────────────────────────────────────────────────────────────────
-        await send(update, reply)
+        await send(update, reply, reply_markup=NEW_SESSION_INLINE)
 
     except Exception:
         # Never leak a stack trace to a user. Log it, apologise, stay running.
@@ -266,12 +303,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await send(update, "Something went wrong on my end. Try again in a moment.")
 
 
+async def post_init(app: Application) -> None:
+    """Publish no command list at all.
+
+    Deleting rather than simply not registering: the list lives on Telegram's
+    servers, so a bot that once had commands keeps showing the ☰ menu forever
+    unless something clears it. This makes a fresh deploy converge on the same
+    state as a clean one.
+
+    /start and /new still work as typed commands, and Telegram's native START
+    button for first-time users is independent of this list. Discovery is the
+    reply keyboard's job.
+    """
+    await app.bot.delete_my_commands()
+    log.info("cleared Telegram command menu")
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
         raise SystemExit("TELEGRAM_TOKEN not set — copy .env.example to .env")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
 
     # Built once, here — never per message. MediRAG holds the Retriever,
     # whose first use loads MedCPT; constructing it per update would pay
@@ -281,9 +334,11 @@ def main() -> None:
     app.bot_data["locks"] = {}
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("scope", scope_cmd))
     app.add_handler(CommandHandler("new", new_session))
+    # An inline tap arrives as a callback query, not a text message, so it
+    # cannot collide with the catch-all handler the way the old reply-keyboard
+    # button did — no ordering constraint and no interception needed.
+    app.add_handler(CallbackQueryHandler(new_session, pattern="^new_session$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     log.info("bot starting (long polling)")
