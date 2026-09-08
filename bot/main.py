@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
+from agent.session import SessionStore
 from config import Config
 from rag.pipeline import MediRAG
 from schema import Message, Role
@@ -179,7 +180,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update,
         "<b>Commands</b>\n"
         "/start — begin\n"
-        "/reset — clear this conversation\n"
+        "/new — start a new session (clears everything)\n"
         "/scope — what I can and can't help with\n"
         "/help — this message",
     )
@@ -190,10 +191,34 @@ async def scope_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send(update, "TODO: scope card")
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.clear()
-    # TODO(day 8): also clear the SessionStore entry for this chat_id.
-    await send(update, "Conversation reset. Tell me what's going on.")
+def chat_lock(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> asyncio.Lock:
+    """One lock per chat, created on demand.
+
+    Held across the whole read-modify-write, not just the store call: the gap
+    between get() and save() spans a 20-45 second LLM call, so two quick
+    messages from the same chat would otherwise both read the same history and
+    the second save would clobber the first. Per-chat rather than global, so
+    one user's slow answer never blocks anybody else.
+
+    No await between the check and the insert, so this is safe on a single
+    event loop without a lock of its own.
+    """
+    locks: dict[int, asyncio.Lock] = context.application.bot_data["locks"]
+    if chat_id not in locks:
+        locks[chat_id] = asyncio.Lock()
+    return locks[chat_id]
+
+
+async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start over: transcript, slots and demographics all discarded.
+
+    Deliberately total. A session is one complaint, and carrying anything
+    across the boundary means the next answer is shaped by the last illness.
+    """
+    chat_id = update.effective_chat.id
+    async with chat_lock(context, chat_id):
+        context.application.bot_data["sessions"].clear(chat_id)
+    await send(update, "Started a new session. Tell me what's going on.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -217,9 +242,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # chat, not even the typing indicator above. One user would block
         # everyone. to_thread hands it to a worker so the loop stays free.
         system: MediRAG = context.application.bot_data["rag"]
-        conversation = [Message(role=Role.USER, text=text)]
-        async with keep_typing(context.bot, chat_id):
-            reply = await asyncio.to_thread(system.answer, conversation)
+        store: SessionStore = context.application.bot_data["sessions"]
+
+        async with chat_lock(context, chat_id):
+            session = store.get(chat_id)
+            session.add(Message(role=Role.USER, text=text))
+            # Copy before handing to the worker thread: the pipeline reads the
+            # transcript off-loop, and a later /new must not mutate the list
+            # underneath it.
+            conversation = list(session.history)
+
+            async with keep_typing(context.bot, chat_id):
+                reply = await asyncio.to_thread(system.answer, conversation)
+
+            session.add(Message(role=Role.BOT, text=reply))
+            store.save(session)
         # ────────────────────────────────────────────────────────────────
         await send(update, reply)
 
@@ -240,11 +277,13 @@ def main() -> None:
     # whose first use loads MedCPT; constructing it per update would pay
     # that cost on every message and hold N copies of a transformer.
     app.bot_data["rag"] = MediRAG(Config())
+    app.bot_data["sessions"] = SessionStore()
+    app.bot_data["locks"] = {}
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("scope", scope_cmd))
-    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("new", new_session))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     log.info("bot starting (long polling)")
